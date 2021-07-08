@@ -3,12 +3,17 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.spec.alpha :as s]
+            [clojure.string :as string]
             [clojure.tools.logging :as log]
             digest
             [integrant.core :as ig]
             [me.raynes.fs :as fs]
             [medley.core :as m])
-  (:import [com.google.cloud.storage Blob$BlobSourceOption BlobId BlobInfo Storage Storage$BlobGetOption Storage$BlobWriteOption Storage$BucketListOption StorageOptions]
+  (:import [com.google.api.gax.paging Page]
+           [com.google.cloud.storage Blob$BlobSourceOption BlobId BlobInfo
+            Storage Storage$BlobGetOption Storage$BlobWriteOption Storage$BucketListOption
+            StorageOptions Storage$BlobListOption]
+           [com.google.cloud.storage BlobId Storage$BlobListOption]
            java.nio.channels.Channels))
 
 (defprotocol StorageClient
@@ -16,7 +21,8 @@
   (exists? [this bucket-name blob-name])
   (blob-writer [this bucket-name blob-name opts])
   (copy-blob [this from to])
-  (move-blob [this from to]))
+  (move-blob [this from to])
+  (ls [this bucket-name directory]))
 
 ;;,------
 ;;| Blobs
@@ -92,6 +98,33 @@
     (.copyTo from-blob ^String to-bucket-name ^String to-blob-name (make-array Blob$BlobSourceOption 0))
     (.delete from-blob (make-array Blob$BlobSourceOption 0))))
 
+(defn- page->seq
+  [^Page page]
+  (iterator-seq
+   (.iterator (.iterateAll page))))
+
+(defn- prefix
+  "Returns a prefix to filter results to blobs whose names begin with this
+  prefix.
+
+  Ensures that a prefix is a valid directory (i.e. has a trailing slash)
+  or an empty string (no prefix, i.e. returns all files blobs in a bucket)."
+  [directory]
+  (cond
+    (empty? directory) ""
+    (not (string/ends-with? directory "/")) (str directory "/")
+    :else directory))
+
+(defn- gcs-ls [^Storage gservice bucket-name directory]
+  (for [file (page->seq
+              (.list gservice bucket-name
+                     (into-array Storage$BlobListOption
+                                 [(Storage$BlobListOption/prefix
+                                   (prefix directory))])))]
+    {:blob-name (.getName file)
+     :update-time (.getUpdateTime file)
+     :size (.getSize file)}))
+
 (defrecord GCSStorageClient [^Storage gservice]
   clj-gcp.storage.core/StorageClient
   (get-blob [this bucket-name blob-name]
@@ -103,7 +136,10 @@
   (copy-blob [this from to]
     (gcs-copy-blob gservice from to))
   (move-blob [this from to]
-    (gcs-move-blob gservice from to)))
+    (gcs-move-blob gservice from to))
+  (ls [this bucket-name directory]
+    (gcs-ls gservice bucket-name directory)))
+
 (alter-meta! #'->GCSStorageClient assoc :private true)
 
 (defn gcs-healthcheck
@@ -213,6 +249,31 @@
     (mkdirs to*)
     (fs/rename (bucket+path->file base-path from) to*)))
 
+(defn- storage-file? [file?]
+  (and (.isFile file?)
+       (not (string/starts-with? (.getFileName (.toPath file?)) "."))))
+
+(defn- blob-name
+  [file]
+  (let [[_base-path _bucket & rest] (-> file .getPath (string/split #"/"))]
+    (string/join "/" rest)))
+
+(defn- fs-files->props [files]
+  (for [file files
+        :when (storage-file? file)
+        :let [blob-name (blob-name file)]]
+    {:blob-name blob-name
+     :size (.length file)
+     :update-time (.lastModified file)}))
+
+(defn- fs-ls
+  [base-path bucket directory]
+  (assert (and base-path bucket))
+  (->> (str base-path "/" bucket "/" directory)
+       io/file
+       file-seq
+       fs-files->props))
+
 (defrecord FileSystemStorageClient [base-path]
   StorageClient
   (get-blob [_ bucket blob-name] (fs-get-blob base-path bucket blob-name))
@@ -222,7 +283,9 @@
   (copy-blob [_ from to]
     (fs-copy-blob base-path from to))
   (move-blob [_ from to]
-    (fs-move-blob base-path from to)))
+    (fs-move-blob base-path from to))
+  (ls [_ bucket directory]
+    (fs-ls base-path bucket directory)))
 (alter-meta! #'->FileSystemStorageClient assoc :private true)
 
 (defn ->file-system-storage-client
